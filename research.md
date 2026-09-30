@@ -392,3 +392,221 @@ That way you're not pretending an estimated pitch position is Hawk-Eye precision
 | Strategy insights | **Your analytics model** |
 
 So for a portfolio/research version, **Cricsheet + ESPN commentary + your own NLU is probably the sweet spot**. You can build almost everything you described—bowler targeting patterns, approximate pitch maps, batter scoring zones, shot selection, matchup analysis, phases, and inferred strategy—while making it clear which metrics are inferred rather than true Hawk-Eye tracking. :chatgpt-content-reference{index="11"}
+
+
+If you mean the current **`python-espncricinfo`** package, then **no, not every endpoint I listed is exposed cleanly as a first-class wrapper method**.
+
+The package mainly focuses on **matches, summaries, series, and players**. Its current match implementation actually fetches ESPNcricinfo pages with Playwright and extracts embedded `__NEXT_DATA__`, partly because some older direct ESPN endpoints are blocked by Akamai. :chatgpt-content-reference{index="0"}
+
+Roughly:
+
+| Data / endpoint family | Covered by `python-espncricinfo`? |
+|---|---:|
+| Recent/current matches | Yes |
+| Match metadata | Yes |
+| Full scorecard / innings | Yes |
+| Batting scorecard | Yes |
+| Bowling scorecard | Yes |
+| Team/player lists for match | Yes |
+| Toss/result/venue/officials | Yes |
+| Series information | Yes |
+| Player profile | Yes |
+| Player stats | Yes, partly via ESPN stats pages |
+| Ball-by-ball commentary | **Partially / internally referenced** |
+| `/match/comments` URL generation | Yes |
+| All commentary pages automatically downloaded | Not as cleanly as you'd expect |
+| `/site/v2/.../summary` | Internally referenced |
+| `/site/v2/.../scoreboard` | Not really a dedicated public wrapper API |
+| `/site/v2/.../news` | No obvious high-level wrapper |
+| Team `/pages/team/home` | Not a major first-class interface |
+| Scheduled/results-by-date endpoints | Some equivalent functionality, not necessarily direct wrapper for every route |
+| Hawk-Eye data | **No** |
+| Exact pitch coordinates | **No** |
+| Ball trajectory | **No** |
+
+The interesting bit is in `Match`.
+
+The package currently contains this method:
+
+```python
+def innings_comms_url(self, innings=1, page=1):
+    return (
+        f"https://hsapi.espncricinfo.com/v1/pages/match/comments"
+        f"?lang=en&leagueId={self.series_id}&eventId={self.match_id}"
+        f"&period={innings}&page={page}&filter=full&liveTest=false"
+    )
+```
+
+So the author knows about and exposes the commentary endpoint URL internally. :chatgpt-content-reference{index="1"}
+
+It also contains:
+
+```python
+def _espn_api_url(self):
+    return (
+        f"https://site.api.espn.com/apis/site/v2/sports/cricket/"
+        f"{self.series_id}/summary?event={self.match_id}"
+    )
+```
+
+and the older core endpoint:
+
+```python
+self.event_url = (
+    "http://core.espnuk.org/v2/sports/cricket/leagues/"
+    f"{self.series_id}/events/{match_id}"
+)
+```
+
+So the package uses multiple ESPN data sources underneath. :chatgpt-content-reference{index="2"}
+
+For players it directly references both:
+
+```text
+core.espnuk.org/v2/sports/cricket/athletes/{playerId}
+```
+
+and:
+
+```text
+hs-consumer-api.espncricinfo.com/v1/pages/player/home?playerId={playerId}
+``` :chatgpt-content-reference{index="3"}
+
+
+The bigger limitation for **your project** is commentary. The modern package's `get_comms_json()` currently says commentary is available in its fetched page content and returns `None`, rather than providing a polished method like:
+
+```python
+match.get_all_deliveries()
+```
+
+that automatically paginates every innings' `/comments` endpoint. :chatgpt-content-reference{index="4"}
+
+So I would actually use the package for discovery/metadata:
+
+```python
+from espncricinfo.match import Match
+
+matches = Match.get_recent_matches(date="2026-09-29")
+
+for ref in matches:
+    print(ref.series_id, ref.match_id)
+```
+
+then instantiate:
+
+```python
+match = Match(
+    match_id=1478914,
+    series_id=1478874
+)
+```
+
+and use fields like:
+
+```python
+match.description
+match.result
+match.all_innings
+match.team_1_players
+match.team_2_players
+```
+
+But for the thing you care about most—
+
+```text
+EVERY BALL
++
+FULL COMMENTARY
+```
+
+—I would probably call the commentary endpoint yourself:
+
+```python
+import requests
+
+BASE = "https://hsapi.espncricinfo.com/v1/pages/match/comments"
+
+
+def get_commentary(series_id, match_id, innings, page=1):
+    params = {
+        "lang": "en",
+        "leagueId": series_id,
+        "eventId": match_id,
+        "period": innings,
+        "page": page,
+        "filter": "full",
+        "liveTest": "false",
+    }
+
+    r = requests.get(
+        BASE,
+        params=params,
+        headers={
+            "User-Agent": "Mozilla/5.0"
+        },
+        timeout=20,
+    )
+
+    r.raise_for_status()
+
+    return r.json()
+```
+
+Then paginate:
+
+```python
+all_comments = []
+
+page = 1
+
+while True:
+    data = get_commentary(
+        series_id=1478874,
+        match_id=1478914,
+        innings=1,
+        page=page,
+    )
+
+    comments = data.get("comments", [])
+
+    if not comments:
+        break
+
+    all_comments.extend(comments)
+
+    page += 1
+```
+
+Though the exact location of `comments` in the returned JSON may vary, so inspect one real response first.
+
+For your architecture, I'd therefore do:
+
+```text
+python-espncricinfo
+        ↓
+match discovery
+series ID
+match ID
+scorecard
+players
+innings
+metadata
+
+        +
+
+direct ESPN commentary endpoint
+        ↓
+full ball-by-ball commentary
+
+        ↓
+
+your parser / NLU
+        ↓
+rich delivery JSON
+```
+
+That is better than relying completely on the package.
+
+And to be clear: **nothing in `python-espncricinfo` gives you actual Hawk-Eye tracking data.** It does not solve exact pitch location, trajectory, bounce coordinates, seam movement, etc.
+
+If you want, I can next give you a **single Python client class that wraps all the ESPN endpoints we found directly**, including match discovery, scorecard, summary, player data, and automatic pagination of every commentary ball, so you don't need `python-espncricinfo` at all.
