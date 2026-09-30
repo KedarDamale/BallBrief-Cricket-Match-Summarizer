@@ -13,6 +13,11 @@ dependencies = [
     "playwright>=1.63.0",
 ]
 
+[dependency-groups]
+dev = [
+    "uvicorn[standard]>=0.35.0",
+]
+
 [project.scripts]
 cricket-match-summarizer = "cricket_match_summarizer:main"
 

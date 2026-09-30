@@ -4,6 +4,6 @@ app=FastAPI()
 
 @app.get("/")
 def hello():
-    pass
+    return {"name":"kedar"}
 
 
