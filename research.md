@@ -1,612 +1,2034 @@
-### ESPNcricinfo data
+Yes — for your project I would go **Playwright-only** and treat ESPNcricinfo as a website, not as an API.
 
-ESPNcricinfo does **not appear to offer a supported public cricket developer API**. However, its website uses internal JSON endpoints, and several open-source packages wrap those endpoints or scrape the site. These are unofficial and can change. :chatgpt-content-reference{index="0"}
-
-A particularly interesting current Python option is **`pycricinfo`**. It was updated in 2026, uses ESPNcricinfo's undocumented APIs/scraping, represents responses with Pydantic models, and can optionally expose them through a FastAPI wrapper. It's still marked pre-release, though. :chatgpt-content-reference{index="1"}
-
-```bash
-pip install pycricinfo
-```
-
-There is also the older:
-
-```bash
-pip install python-espncricinfo
-```
-
-but the PyPI release itself is quite old. The actively modified GitHub code is more interesting because it now works around ESPN's newer architecture. :chatgpt-content-reference{index="2"}
-
-What's especially relevant to you is that the current code references ESPN's commentary endpoint in roughly this form:
+That means:
 
 ```text
-https://hsapi.espncricinfo.com/v1/pages/match/comments
+ESPN page
+   ↓
+Playwright/WebKit
+   ├── __NEXT_DATA__
+   ├── JSON/XHR/fetch responses
+   ├── DOM as fallback
+   └── SVG/canvas/image assets if present
+             ↓
+your normalized cricket schema
+             ↓
+NLU over commentary
 ```
 
-with parameters such as:
+That is also broadly the direction the maintained `python-espncricinfo` package has taken: it now uses Playwright/WebKit to load ESPNcricinfo pages and extract `__NEXT_DATA__` because of Akamai restrictions on older direct API access. :chatgpt-content-reference{index="0"}
 
-```text
-leagueId
-eventId
-period
-page
-filter=full
-```
-
-The library's current implementation explicitly constructs that endpoint for retrieving match commentary. :chatgpt-content-reference{index="3"}
-
-So you can potentially get something like:
-
-```json
-{
-  "over": 17,
-  "ball": 3,
-  "batter": "Virat Kohli",
-  "bowler": "Mitchell Starc",
-  "runs": 4,
-  "commentary": "Full outside off, Kohli drives beautifully through cover..."
-}
-```
-
-and then feed `commentary` into your NLU system.
-
-The important caveat is that these are **internal/undocumented interfaces**, not an API contract you should assume will remain stable.
+The important caveat is **Hawk-Eye**: Playwright can capture Hawk-Eye-derived data **only if ESPN actually sends that data to the browser**. Hawk-Eye itself says its tracking feeds are provided to partners; I found no public raw tracking feed. :chatgpt-content-reference{index="1"}
 
 ---
 
-## An even better data source for your research project: Cricsheet
+# What I would extract
 
-For the structured side of your project, I would actually use **Cricsheet alongside ESPN**, rather than relying entirely on ESPN.
+| Label | What you can collect | Confidence |
+|---|---|---:|
+| `match_discovery` | match IDs, series IDs, match cards | ✅ verified |
+| `match_metadata` | status, date, format, title, scheduled overs | ✅ verified |
+| `series` | ID, name, slug | ✅ verified |
+| `venue` | ground ID, ground name, city/location | ✅ verified |
+| `teams` | IDs, names, abbreviations, home team | ✅ verified |
+| `toss` | winner + bat/bowl | ✅ verified |
+| `result` | winner + result text/status | ✅ verified |
+| `rosters` | squads / match players | ✅ verified |
+| `innings` | runs, wickets, overs, target | ✅ verified |
+| `batting_scorecard` | player, runs, balls, 4s, 6s, SR, dismissal | ✅ verified |
+| `bowling_scorecard` | overs, maidens, runs, wickets, economy, wides, no-balls, dots | ✅ verified |
+| `extras` | byes, leg-byes, wides, no-balls | ✅ verified |
+| `fall_of_wickets` | wicket sequence | ✅ verified |
+| `commentary` | ball-by-ball natural-language descriptions | ✅ available via page/network |
+| `delivery_events` | runs/wicket/ball IDs/etc. when included with commentary payload | ✅ commonly present |
+| `player_profile` | name, role, batting/bowling style, DOB, teams | ✅ page-accessible |
+| `network_json` | every JSON response loaded by page | ✅ |
+| `raw_next_data` | full ESPN Next.js state | ✅ |
+| `wagon_wheel` | only if ESPN sends underlying data to browser | ⚠️ inspect dynamically |
+| `pitch_map` | same | ⚠️ |
+| `ball_speed` | if included in page/commentary/tracking payload | ⚠️ |
+| `trajectory` | only if tracking payload is sent | ⚠️ |
+| `release_point` | same | ⚠️ |
+| `bounce_coordinates` | same | ⚠️ |
+| `swing/seam` | only if ESPN actually receives/displays it | ⚠️ |
+| raw Hawk-Eye `(x,y,z,t)` | no evidence of general public exposure | ❌ not guaranteed |
 
-Cricsheet currently provides ball-by-ball data for nearly **23,000 matches**, including Tests, ODIs, T20Is, IPL, BBL, PSL, The Hundred, SA20 and many other competitions. Data is directly downloadable as JSON, YAML, CSV and XML. :chatgpt-content-reference{index="4"}
+The verified match fields above come directly from current ESPNcricinfo `__NEXT_DATA__` parsing: teams, innings, batsmen, bowlers, FOW, extras, toss, result, venue, series and players are all present in current code. :chatgpt-content-reference{index="2"}
 
-JSON is their main and most complete format. :chatgpt-content-reference{index="5"}
+---
 
-For example:
+# 1. Base Playwright collector
+
+This should be the foundation of everything.
+
+```python
+from __future__ import annotations
+
+import asyncio
+import json
+from typing import Any
+
+from playwright.async_api import (
+    async_playwright,
+    Browser,
+    BrowserContext,
+    Page,
+    Response,
+)
+
+
+class ESPNBrowser:
+    def __init__(self):
+        self.browser: Browser | None = None
+        self.context: BrowserContext | None = None
+        self._pw = None
+
+    async def __aenter__(self):
+        self._pw = await async_playwright().start()
+
+        # Current maintained ESPNcricinfo scraper uses WebKit.
+        self.browser = await self._pw.webkit.launch(
+            headless=True
+        )
+
+        self.context = await self.browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 "
+                "(Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/605.1.15 "
+                "(KHTML, like Gecko) "
+                "Version/16.0 Safari/605.1.15"
+            )
+        )
+
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        if self.context:
+            await self.context.close()
+
+        if self.browser:
+            await self.browser.close()
+
+        if self._pw:
+            await self._pw.stop()
+
+    async def new_page(self) -> Page:
+        if not self.context:
+            raise RuntimeError("Browser not initialized")
+
+        return await self.context.new_page()
+```
+
+The current library specifically uses WebKit because its maintainers found headless WebKit was not blocked by the same Akamai behavior. :chatgpt-content-reference{index="3"}
+
+---
+
+# 2. Universal page capture
+
+For **every ESPN page**, capture three things:
+
+```text
+HTML/DOM
+__NEXT_DATA__
+network JSON
+```
+
+```python
+class PageCapture:
+    def __init__(self):
+        self.next_data: dict | None = None
+        self.network_json: list[dict] = []
+        self.html: str | None = None
+
+
+async def capture_page(
+    browser: ESPNBrowser,
+    url: str,
+    wait_ms: int = 5000,
+) -> PageCapture:
+
+    page = await browser.new_page()
+
+    output = PageCapture()
+
+    async def handle_response(response: Response):
+        content_type = response.headers.get(
+            "content-type",
+            ""
+        ).lower()
+
+        if "json" not in content_type:
+            return
+
+        try:
+            body = await response.json()
+        except Exception:
+            return
+
+        output.network_json.append({
+            "url": response.url,
+            "status": response.status,
+            "body": body,
+        })
+
+    page.on("response", handle_response)
+
+    await page.goto(
+        url,
+        wait_until="domcontentloaded",
+        timeout=60_000,
+    )
+
+    await page.wait_for_timeout(wait_ms)
+
+    output.html = await page.content()
+
+    next_script = page.locator(
+        "script#__NEXT_DATA__"
+    )
+
+    if await next_script.count():
+        raw = await next_script.text_content()
+
+        if raw:
+            output.next_data = json.loads(raw)
+
+    await page.close()
+
+    return output
+```
+
+Now you are no longer dependent on knowing ESPN's private APIs.
+
+---
+
+# 3. Match discovery
+
+Verified page:
+
+```text
+https://www.espncricinfo.com/live-cricket-match-results
+```
+
+Date-specific:
+
+```text
+https://www.espncricinfo.com/live-cricket-match-results?date=2026-09-30
+```
+
+The current scraper reads match IDs from:
+
+```python
+props.appPageProps.data.data.content.matches
+``` :chatgpt-content-reference{index="4"}
+
+
+Code:
+
+```python
+async def get_match_discovery(
+    browser: ESPNBrowser,
+    date: str,
+):
+    url = (
+        "https://www.espncricinfo.com/"
+        f"live-cricket-match-results?date={date}"
+    )
+
+    capture = await capture_page(
+        browser,
+        url,
+    )
+
+    nd = capture.next_data
+
+    if not nd:
+        return []
+
+    try:
+        matches = (
+            nd["props"]
+              ["appPageProps"]
+              ["data"]
+              ["data"]
+              ["content"]
+              ["matches"]
+        )
+    except (KeyError, TypeError):
+        return []
+
+    output = []
+
+    for m in matches:
+        output.append({
+            "label": "match_discovery",
+
+            "match_id":
+                m.get("objectId"),
+
+            "series_id":
+                (m.get("series") or {})
+                .get("objectId"),
+
+            "raw":
+                m,
+        })
+
+    return output
+```
+
+---
+
+# 4. Full scorecard page
+
+Use:
+
+```text
+https://www.espncricinfo.com/series/x-{series_id}/x-{match_id}/full-scorecard
+```
+
+This exact structure is used by the current Playwright implementation. :chatgpt-content-reference{index="5"}
+
+```python
+def full_scorecard_url(
+    series_id: int,
+    match_id: int,
+):
+    return (
+        "https://www.espncricinfo.com/"
+        f"series/x-{series_id}/"
+        f"x-{match_id}/"
+        "full-scorecard"
+    )
+```
+
+---
+
+# 5. Extract ESPN's main data object
+
+Current pages have two known shapes.
+
+```python
+def get_app_data(
+    next_data: dict,
+) -> dict:
+
+    app_data = (
+        next_data
+        ["props"]
+        ["appPageProps"]
+        ["data"]
+    )
+
+    # current/live pages
+    if (
+        "match" in app_data
+        and "content" in app_data
+    ):
+        return app_data
+
+    # wrapped page form
+    if "data" in app_data:
+        return app_data["data"]
+
+    raise KeyError(
+        "Unknown ESPN __NEXT_DATA__ structure"
+    )
+```
+
+This is exactly the distinction current ESPNcricinfo tooling handles. :chatgpt-content-reference{index="6"}
+
+---
+
+# 6. `match_metadata`
+
+```python
+def extract_match_metadata(data: dict):
+    match = data.get("match", {})
+
+    return {
+        "label": "match_metadata",
+
+        "match_id":
+            match.get("objectId"),
+
+        "title":
+            match.get("title"),
+
+        "status":
+            match.get("status"),
+
+        "status_text":
+            match.get("statusText"),
+
+        "format":
+            match.get("format"),
+
+        "international_class_id":
+            match.get("internationalClassId"),
+
+        "season":
+            match.get("season"),
+
+        "start_date":
+            match.get("startDate"),
+
+        "scheduled_overs":
+            match.get("scheduledOvers"),
+
+        "cancelled":
+            match.get("isCancelled"),
+
+        "floodlit":
+            match.get("floodlit"),
+
+        "raw":
+            match,
+    }
+```
+
+Those fields are all currently present in the match parser. :chatgpt-content-reference{index="7"}
+
+---
+
+# 7. `series`
+
+```python
+def extract_series(data: dict):
+    series = (
+        data
+        .get("match", {})
+        .get("series", {})
+    )
+
+    return {
+        "label": "series",
+
+        "series_id":
+            series.get("objectId"),
+
+        "name":
+            series.get("name"),
+
+        "slug":
+            series.get("slug"),
+
+        "raw":
+            series,
+    }
+```
+
+---
+
+# 8. `venue`
+
+```python
+def extract_venue(data: dict):
+    ground = (
+        data
+        .get("match", {})
+        .get("ground", {})
+    )
+
+    town = ground.get("town") or {}
+
+    return {
+        "label": "venue",
+
+        "ground_id":
+            ground.get("objectId"),
+
+        "name":
+            ground.get("name"),
+
+        "long_name":
+            ground.get("longName"),
+
+        "location":
+            ground.get("location"),
+
+        "town":
+            town.get("name"),
+
+        "raw":
+            ground,
+    }
+```
+
+Current parsing confirms ground ID, long name, location and town. :chatgpt-content-reference{index="8"}
+
+---
+
+# 9. `teams`
+
+```python
+def extract_teams(data: dict):
+    teams = (
+        data
+        .get("match", {})
+        .get("teams", [])
+    )
+
+    result = []
+
+    for item in teams:
+        team = item.get("team") or {}
+
+        result.append({
+            "label": "team",
+
+            "team_id":
+                team.get("objectId"),
+
+            "internal_id":
+                team.get("id"),
+
+            "name":
+                team.get("name"),
+
+            "long_name":
+                team.get("longName"),
+
+            "abbreviation":
+                team.get("abbreviation"),
+
+            "is_home":
+                item.get("isHome"),
+
+            "raw":
+                item,
+        })
+
+    return result
+```
+
+These exact team fields are currently normalized by the maintained scraper. :chatgpt-content-reference{index="9"}
+
+---
+
+# 10. `toss`
+
+```python
+def extract_toss(data: dict):
+    match = data.get("match", {})
+
+    choice = match.get(
+        "tossWinnerChoice"
+    )
+
+    choice_name = {
+        1: "bat",
+        2: "bowl",
+    }.get(choice)
+
+    return {
+        "label": "toss",
+
+        "winner_internal_team_id":
+            match.get(
+                "tossWinnerTeamId"
+            ),
+
+        "choice_code":
+            choice,
+
+        "choice":
+            choice_name,
+    }
+```
+
+The current implementation maps `1 = bat`, `2 = bowl`. :chatgpt-content-reference{index="10"}
+
+---
+
+# 11. `result`
+
+```python
+def extract_result(data: dict):
+    match = data.get("match", {})
+
+    return {
+        "label": "result",
+
+        "winner_internal_team_id":
+            match.get(
+                "winnerTeamId"
+            ),
+
+        "status":
+            match.get("status"),
+
+        "status_text":
+            match.get("statusText"),
+    }
+```
+
+---
+
+# 12. `rosters`
+
+Path:
+
+```text
+content.matchPlayers.teamPlayers
+```
+
+verified in the current code. :chatgpt-content-reference{index="11"}
+
+```python
+def extract_rosters(data: dict):
+    match_players = (
+        data
+        .get("content", {})
+        .get("matchPlayers", {})
+    )
+
+    teams = match_players.get(
+        "teamPlayers",
+        []
+    )
+
+    result = []
+
+    for team_entry in teams:
+        team = team_entry.get("team") or {}
+
+        result.append({
+            "label": "roster",
+
+            "team": {
+                "id":
+                    team.get("objectId"),
+
+                "name":
+                    team.get("name"),
+
+                "long_name":
+                    team.get("longName"),
+            },
+
+            "players":
+                team_entry.get(
+                    "players",
+                    []
+                ),
+
+            "raw":
+                team_entry,
+        })
+
+    return result
+```
+
+Keep raw player objects because ESPN can include additional metadata.
+
+---
+
+# 13. `innings`
+
+Path:
+
+```text
+content.innings
+```
+
+Verified current fields include:
+
+```text
+team
+runs
+wickets
+overs
+event
+inningNumber
+inningBatsmen
+inningBowlers
+inningFallOfWickets
+extras
+byes
+legbyes
+wides
+noballs
+target
+``` :chatgpt-content-reference{index="12"}
+
+
+```python
+def extract_innings(data: dict):
+    innings = (
+        data
+        .get("content", {})
+        .get("innings", [])
+    )
+
+    result = []
+
+    for inn in innings:
+        team = inn.get("team") or {}
+
+        result.append({
+            "label": "innings",
+
+            "innings_number":
+                inn.get("inningNumber"),
+
+            "team_id":
+                team.get("objectId"),
+
+            "team":
+                team.get("name"),
+
+            "runs":
+                inn.get("runs"),
+
+            "wickets":
+                inn.get("wickets"),
+
+            "overs":
+                inn.get("overs"),
+
+            "target":
+                inn.get("target"),
+
+            "event":
+                inn.get("event"),
+
+            "raw":
+                inn,
+        })
+
+    return result
+```
+
+---
+
+# 14. `batting_scorecard`
+
+```python
+def extract_batting_scorecard(
+    innings: dict,
+):
+    result = []
+
+    for raw in innings.get(
+        "inningBatsmen",
+        []
+    ):
+        player = raw.get("player") or {}
+
+        dismissal = (
+            raw.get("dismissalText")
+            or {}
+        )
+
+        result.append({
+            "label":
+                "batting_scorecard",
+
+            "player_id":
+                player.get("objectId"),
+
+            "name":
+                player.get("name"),
+
+            "full_name":
+                player.get("longName"),
+
+            "runs":
+                raw.get("runs"),
+
+            "balls":
+                raw.get("balls"),
+
+            "minutes":
+                raw.get("minutes"),
+
+            "fours":
+                raw.get("fours"),
+
+            "sixes":
+                raw.get("sixes"),
+
+            "strike_rate":
+                raw.get("strikerate"),
+
+            "is_out":
+                raw.get("isOut"),
+
+            "batted_type":
+                raw.get("battedType"),
+
+            "dismissal":
+                dismissal.get("long"),
+
+            "raw":
+                raw,
+        })
+
+    return result
+```
+
+Current implementation confirms those batting fields. :chatgpt-content-reference{index="13"}
+
+---
+
+# 15. `bowling_scorecard`
+
+```python
+def extract_bowling_scorecard(
+    innings: dict,
+):
+    result = []
+
+    for raw in innings.get(
+        "inningBowlers",
+        []
+    ):
+        player = raw.get("player") or {}
+
+        result.append({
+            "label":
+                "bowling_scorecard",
+
+            "player_id":
+                player.get("objectId"),
+
+            "name":
+                player.get("name"),
+
+            "full_name":
+                player.get("longName"),
+
+            "overs":
+                raw.get("overs"),
+
+            "maidens":
+                raw.get("maidens"),
+
+            "runs_conceded":
+                raw.get("conceded"),
+
+            "wickets":
+                raw.get("wickets"),
+
+            "economy":
+                raw.get("economy"),
+
+            "wides":
+                raw.get("wides"),
+
+            "no_balls":
+                raw.get("noballs"),
+
+            "dots":
+                raw.get("dots"),
+
+            "raw":
+                raw,
+        })
+
+    return result
+```
+
+These fields are directly confirmed in current code. :chatgpt-content-reference{index="14"}
+
+---
+
+# 16. `extras`
+
+```python
+def extract_extras(innings: dict):
+    return {
+        "label": "extras",
+
+        "total":
+            innings.get("extras"),
+
+        "byes":
+            innings.get("byes"),
+
+        "leg_byes":
+            innings.get("legbyes"),
+
+        "wides":
+            innings.get("wides"),
+
+        "no_balls":
+            innings.get("noballs"),
+    }
+``` :chatgpt-content-reference{index="15"}
+
+
+---
+
+# 17. `fall_of_wickets`
+
+```python
+def extract_fall_of_wickets(
+    innings: dict,
+):
+    return {
+        "label": "fall_of_wickets",
+
+        "wickets":
+            innings.get(
+                "inningFallOfWickets",
+                [],
+            ),
+    }
+```
+
+Verified path. :chatgpt-content-reference{index="16"}
+
+---
+
+# 18. Ball-by-ball commentary
+
+For this one I would **not even depend on the known comments URL**.
+
+Open ESPN's normal commentary page:
+
+```python
+def commentary_page_url(
+    series_id: int,
+    match_id: int,
+):
+    return (
+        "https://www.espncricinfo.com/"
+        f"series/x-{series_id}/"
+        f"x-{match_id}/"
+        "ball-by-ball-commentary"
+    )
+```
+
+Then capture every JSON response.
+
+---
+
+# 19. Automatically detect commentary payloads
+
+Rather than relying on URL names:
+
+```python
+def walk_objects(obj):
+    if isinstance(obj, dict):
+        yield obj
+
+        for value in obj.values():
+            yield from walk_objects(value)
+
+    elif isinstance(obj, list):
+        for item in obj:
+            yield from walk_objects(item)
+```
+
+Then detect objects that look like delivery commentary:
+
+```python
+def looks_like_delivery(
+    obj: dict,
+) -> bool:
+
+    keys = set(obj.keys())
+
+    strong_keys = {
+        "overNumber",
+        "ballNumber",
+    }
+
+    if not strong_keys.issubset(keys):
+        return False
+
+    supporting = {
+        "title",
+        "totalRuns",
+        "batsmanRuns",
+        "isWicket",
+        "commentTextItems",
+    }
+
+    return bool(
+        keys.intersection(supporting)
+    )
+```
+
+Extractor:
+
+```python
+def extract_commentary_from_network(
+    network_json: list[dict],
+):
+    deliveries = []
+
+    seen = set()
+
+    for response in network_json:
+        body = response["body"]
+
+        for obj in walk_objects(body):
+
+            if not isinstance(obj, dict):
+                continue
+
+            if not looks_like_delivery(obj):
+                continue
+
+            key = (
+                obj.get("inningNumber"),
+                obj.get("overNumber"),
+                obj.get("ballNumber"),
+                obj.get("id"),
+            )
+
+            if key in seen:
+                continue
+
+            seen.add(key)
+
+            deliveries.append({
+                "label":
+                    "ball_commentary",
+
+                "innings":
+                    obj.get(
+                        "inningNumber"
+                    ),
+
+                "over":
+                    obj.get(
+                        "overNumber"
+                    ),
+
+                "ball":
+                    obj.get(
+                        "ballNumber"
+                    ),
+
+                "total_runs":
+                    obj.get(
+                        "totalRuns"
+                    ),
+
+                "batter_runs":
+                    obj.get(
+                        "batsmanRuns"
+                    ),
+
+                "is_four":
+                    obj.get(
+                        "isFour"
+                    ),
+
+                "is_six":
+                    obj.get(
+                        "isSix"
+                    ),
+
+                "is_wicket":
+                    obj.get(
+                        "isWicket"
+                    ),
+
+                "byes":
+                    obj.get("byes"),
+
+                "leg_byes":
+                    obj.get(
+                        "legbyes"
+                    ),
+
+                "wides":
+                    obj.get(
+                        "wides"
+                    ),
+
+                "no_balls":
+                    obj.get(
+                        "noballs"
+                    ),
+
+                "batter_id":
+                    obj.get(
+                        "batsmanPlayerId"
+                    ),
+
+                "bowler_id":
+                    obj.get(
+                        "bowlerPlayerId"
+                    ),
+
+                "title":
+                    obj.get("title"),
+
+                "dismissal":
+                    obj.get(
+                        "dismissalText"
+                    ),
+
+                "comment_pre":
+                    obj.get(
+                        "commentPreTextItems"
+                    ),
+
+                "comment":
+                    obj.get(
+                        "commentTextItems"
+                    ),
+
+                "comment_post":
+                    obj.get(
+                        "commentPostTextItems"
+                    ),
+
+                "videos":
+                    obj.get(
+                        "commentVideos"
+                    ),
+
+                "timestamp":
+                    obj.get(
+                        "timestamp"
+                    ),
+
+                "raw":
+                    obj,
+            })
+
+    return deliveries
+```
+
+Those delivery-level field names have historically appeared in ESPNcricinfo commentary payloads, including innings, over, ball, runs, four/six/wicket flags, extras, batter/bowler IDs, dismissal text and commentary blocks. :chatgpt-content-reference{index="17"}
+
+Most importantly, the code above only accepts them **if the browser actually sees them**.
+
+---
+
+# 20. Trigger lazy-loaded commentary
+
+ESPN may not load the entire innings immediately.
+
+So scroll:
+
+```python
+async def auto_scroll(
+    page: Page,
+    max_rounds: int = 100,
+):
+    previous_height = 0
+
+    for _ in range(max_rounds):
+
+        current_height = await page.evaluate(
+            "document.body.scrollHeight"
+        )
+
+        if current_height == previous_height:
+            break
+
+        previous_height = current_height
+
+        await page.evaluate(
+            "window.scrollTo("
+            "0, document.body.scrollHeight"
+            ")"
+        )
+
+        await page.wait_for_timeout(
+            1200
+        )
+```
+
+---
+
+# 21. Commentary crawler
+
+```python
+async def crawl_commentary(
+    browser: ESPNBrowser,
+    series_id: int,
+    match_id: int,
+):
+    page = await browser.new_page()
+
+    network: list[dict] = []
+
+    async def on_response(response):
+        ctype = response.headers.get(
+            "content-type",
+            ""
+        ).lower()
+
+        if "json" not in ctype:
+            return
+
+        try:
+            body = await response.json()
+        except Exception:
+            return
+
+        network.append({
+            "url": response.url,
+            "status": response.status,
+            "body": body,
+        })
+
+    page.on(
+        "response",
+        on_response
+    )
+
+    await page.goto(
+        commentary_page_url(
+            series_id,
+            match_id,
+        ),
+        wait_until="domcontentloaded",
+        timeout=60_000,
+    )
+
+    await auto_scroll(page)
+
+    await page.wait_for_timeout(
+        3000
+    )
+
+    await page.close()
+
+    return {
+        "label":
+            "commentary_capture",
+
+        "deliveries":
+            extract_commentary_from_network(
+                network
+            ),
+
+        "raw_network":
+            network,
+    }
+```
+
+---
+
+# 22. `player_profile`
+
+You can also Playwright-load:
+
+```text
+https://www.espncricinfo.com/player/player-name-{player_id}
+```
+
+The older/current player structures contain things such as:
+
+```text
+name
+first name
+full name
+DOB
+age
+playing role
+batting style
+bowling style
+major teams
+``` :chatgpt-content-reference{index="18"}
+
+
+Generic approach:
+
+```python
+async def capture_player(
+    browser: ESPNBrowser,
+    player_id: int,
+):
+    url = (
+        "https://www.espncricinfo.com/"
+        f"player/player-name-{player_id}"
+    )
+
+    capture = await capture_page(
+        browser,
+        url,
+    )
+
+    return {
+        "label": "player_profile",
+
+        "player_id": player_id,
+
+        "next_data":
+            capture.next_data,
+
+        "network_json":
+            capture.network_json,
+    }
+```
+
+I would again inspect and normalize the observed current JSON instead of assuming today's player-page nesting remains forever.
+
+---
+
+# 23. Generic network-data discovery
+
+This part is extremely useful.
+
+Print every JSON URL ESPN loads:
+
+```python
+def print_network_inventory(
+    network_json: list[dict],
+):
+    for item in network_json:
+        print(
+            item["status"],
+            item["url"],
+        )
+```
+
+Now you'll discover future ESPN features without updating your crawler beforehand.
+
+---
+
+# 24. Recursively inspect every available key
+
+```python
+def collect_keys(
+    obj,
+    prefix="",
+    output=None,
+):
+    if output is None:
+        output = set()
+
+    if isinstance(obj, dict):
+
+        for key, value in obj.items():
+
+            path = (
+                f"{prefix}.{key}"
+                if prefix
+                else key
+            )
+
+            output.add(path)
+
+            collect_keys(
+                value,
+                path,
+                output,
+            )
+
+    elif isinstance(obj, list):
+
+        for item in obj[:3]:
+            collect_keys(
+                item,
+                prefix + "[]",
+                output,
+            )
+
+    return output
+```
+
+Usage:
+
+```python
+keys = collect_keys(
+    captured_json
+)
+
+for key in sorted(keys):
+    print(key)
+```
+
+That tells you exactly what ESPN exposes today.
+
+---
+
+# Now Hawk-Eye
+
+This needs a very strict distinction.
+
+Hawk-Eye states that it generates ball/player tracking data and supplies data feeds to partners, including live, delayed, play-by-play and summary feeds. It also specifically describes cricket tracking systems capable of producing pitch maps and related visualizations. :chatgpt-content-reference{index="19"}
+
+But:
+
+> There is no evidence I found that ESPNcricinfo generally exposes the raw Hawk-Eye partner feed to anonymous browsers.
+
+So we should **probe for it**, not assume it exists.
+
+---
+
+# 25. `tracking_candidate`
+
+Search every browser JSON response for tracking-related fields.
+
+```python
+TRACKING_TERMS = {
+    "hawkeye",
+    "hawk_eye",
+    "tracking",
+    "trajectory",
+    "balltracking",
+    "ball_tracking",
+
+    "pitchmap",
+    "pitch_map",
+
+    "wagonwheel",
+    "wagon_wheel",
+
+    "beehive",
+
+    "releasepoint",
+    "release_point",
+
+    "bounce",
+    "bouncepoint",
+    "bounce_point",
+
+    "impact",
+    "impactpoint",
+
+    "speed",
+    "velocity",
+
+    "swing",
+    "seam",
+
+    "coordinates",
+    "coordinate",
+
+    "x",
+    "y",
+    "z",
+}
+
+
+def find_tracking_candidates(
+    obj,
+    path="root",
+):
+    candidates = []
+
+    if isinstance(obj, dict):
+
+        lower_keys = {
+            str(k).lower()
+            for k in obj.keys()
+        }
+
+        matched = (
+            lower_keys
+            & TRACKING_TERMS
+        )
+
+        if matched:
+            candidates.append({
+                "label":
+                    "tracking_candidate",
+
+                "path":
+                    path,
+
+                "matched_keys":
+                    sorted(matched),
+
+                "payload":
+                    obj,
+            })
+
+        for key, value in obj.items():
+
+            candidates.extend(
+                find_tracking_candidates(
+                    value,
+                    f"{path}.{key}",
+                )
+            )
+
+    elif isinstance(obj, list):
+
+        for i, value in enumerate(obj):
+
+            candidates.extend(
+                find_tracking_candidates(
+                    value,
+                    f"{path}[{i}]",
+                )
+            )
+
+    return candidates
+```
+
+---
+
+# 26. Probe the entire page for Hawk-Eye-like data
+
+```python
+def probe_tracking(
+    network_json: list[dict],
+):
+    findings = []
+
+    for response in network_json:
+
+        found = find_tracking_candidates(
+            response["body"]
+        )
+
+        for item in found:
+
+            item["source_url"] = (
+                response["url"]
+            )
+
+            findings.append(item)
+
+    return findings
+```
+
+If ESPN is sending something like:
 
 ```json
 {
-  "overs": [
+  "pitchMap": {
+    "x": 0.31,
+    "y": 6.72
+  }
+}
+```
+
+or:
+
+```json
+{
+  "trajectory": [
     {
-      "over": 14,
-      "deliveries": [
-        {
-          "batter": "V Kohli",
-          "bowler": "MA Starc",
-          "non_striker": "RG Sharma",
-          "runs": {
-            "batter": 4,
-            "extras": 0,
-            "total": 4
-          }
-        }
-      ]
+      "x": 0.2,
+      "y": 12.5,
+      "z": 1.7
     }
   ]
 }
 ```
 
-For your system I'd combine:
+you'll catch it automatically.
 
-```text
-Cricsheet
-   ↓
-Reliable structured ball data
-
-ESPN commentary
-   ↓
-Rich natural-language description
-
-         ↓ JOIN ON MATCH + INNINGS + BALL
-
-Complete delivery record
-```
-
-That is much stronger than trying to derive everything from commentary.
-
----
-
-# Now the bad news: Hawk-Eye
-
-There is **no normal free/public Hawk-Eye cricket API** comparable to something like an OpenWeather API.
-
-Hawk-Eye itself says it produces ball/player tracking data and provides multiple types of **data feeds to partners**, including live, delayed, play-by-play and summary feeds. :chatgpt-content-reference{index="6"}
-
-For cricket specifically, Hawk-Eye describes its technology as providing precise ball tracking and UltraEdge and says it covers more than 1,000 cricket match days per year across 15 countries. :chatgpt-content-reference{index="7"}
-
-But access is primarily through contractual relationships with:
-
-```text
-sports federations
-leagues
-teams
-broadcasters
-commercial analytics companies
-```
-
-rather than a public:
-
-```text
-GET /hawkeye/cricket/match/12345
-```
-
-API.
-
-Hawk-Eye's own privacy/data documentation confirms that it shares tracking data and products with sporting customers such as federations, leagues, teams and broadcasters. :chatgpt-content-reference{index="8"}
-
----
-
-# What Hawk-Eye data would contain
-
-If you actually had the full ball-tracking feed, it could contain dramatically richer information than commentary.
-
-Conceptually:
-
-```json
-{
-  "delivery_id": "17.3",
-
-  "release": {
-    "x": 0.17,
-    "y": 1.94,
-    "z": 18.7
-  },
-
-  "speed": {
-    "release_kph": 143.2
-  },
-
-  "pitch": {
-    "x": -0.31,
-    "y": 5.82
-  },
-
-  "bounce_height": 0.48,
-
-  "trajectory": [
-    {"t": 0.00, "x": 0.17, "y": 18.7, "z": 1.94},
-    {"t": 0.02, "x": 0.16, "y": 18.0, "z": 1.90},
-    {"t": 0.04, "x": 0.15, "y": 17.2, "z": 1.85}
-  ],
-
-  "movement": {
-    "swing_deg": 1.7,
-    "seam_deg": 0.8
-  },
-
-  "impact": {
-    "x": -0.12,
-    "height": 0.72
-  }
-}
-```
-
-With data like that you can create real:
-
-```text
-pitch maps
-release maps
-line maps
-length maps
-bounce maps
-swing charts
-seam movement
-pace distributions
-trajectory visualisations
-bowling heatmaps
-```
-
-That's very different from estimating these things from text.
-
----
-
-# There are commercial routes to Hawk-Eye data
-
-There are cricket analytics platforms that explicitly integrate Hawk-Eye.
-
-For example, **CricViz Centurion** says it uses official third-party ball-tracking sources including Hawk-Eye and Virtual Eye to analyze speed, line and length. :chatgpt-content-reference{index="9"}
-
-**NV Play** also explicitly lists Hawk-Eye ball-tracking integration among its supported data integrations. :chatgpt-content-reference{index="10"}
-
-So the commercial chain is more like:
-
-```text
-Hawk-Eye cameras
-       ↓
-Hawk-Eye tracking system
-       ↓
-Official data feed
-       ↓
-League / broadcaster / team
-       ↓
-CricViz / NV Play / analytics systems
-```
-
-rather than:
-
-```text
-developer → free Hawk-Eye API
-```
-
----
-
-# Can you scrape Hawk-Eye data from ESPN?
-
-Usually **not the actual underlying tracking dataset**.
-
-You may sometimes see graphics on broadcasts/websites showing:
-
-```text
-pitch position
-wagon wheel
-ball trajectory
-speed
-projected path
-```
-
-but seeing the visualization does not mean the complete `(x,y,z,t)` tracking feed is exposed through ESPN's commentary API.
-
-That's an important distinction:
-
-```text
-ESPN commentary
-
-"short of a length outside off"
-```
-
-versus:
-
-```text
-Hawk-Eye
-
-pitch_x = 0.42
-pitch_y = 7.21
-release_speed = 143.7
-bounce_height = 0.81
-trajectory = [...]
-```
-
-The second is actual sensor/computer-vision-derived tracking.
-
----
-
-# For your project, this is what I would build
-
-You can still make a **very impressive cricket analytics project without Hawk-Eye**.
+But **do not label it `hawkeye` just because it contains coordinates**.
 
 Use:
 
 ```text
-                    ┌────────────────┐
-                    │   Cricsheet    │
-                    │                │
-                    │ score          │
-                    │ runs           │
-                    │ wickets        │
-                    │ batter         │
-                    │ bowler         │
-                    └───────┬────────┘
-                            │
-                            │ join
-                            │
-┌────────────────┐          ▼
-│ ESPN Cricinfo  │    ┌──────────────┐
-│                │───▶│ Delivery DB  │
-│ commentary     │    └───────┬──────┘
-└────────────────┘            │
-                              ▼
-                     ┌─────────────────┐
-                     │ NLU Extractor   │
-                     │                 │
-                     │ line            │
-                     │ length          │
-                     │ shot            │
-                     │ field position  │
-                     │ bowling type    │
-                     │ movement words  │
-                     └────────┬────────┘
-                              │
-                              ▼
-                       Structured JSON
-                              │
-             ┌────────────────┼────────────────┐
-             ▼                ▼                ▼
-        Pitch maps       Wagon wheels     Strategy
-        heat maps        shot maps        analysis
+tracking_candidate
 ```
 
-Your extracted delivery might become:
+until you identify the provider.
+
+---
+
+# 27. Detect Hawk-Eye URLs themselves
+
+```python
+def find_tracking_urls(
+    network_json: list[dict],
+):
+    keywords = [
+        "hawk",
+        "tracking",
+        "trajectory",
+        "wagon",
+        "pitch",
+        "beehive",
+    ]
+
+    results = []
+
+    for item in network_json:
+
+        url = item["url"].lower()
+
+        if any(
+            k in url
+            for k in keywords
+        ):
+            results.append({
+                "label":
+                    "tracking_network_request",
+
+                "url":
+                    item["url"],
+
+                "status":
+                    item["status"],
+
+                "body":
+                    item["body"],
+            })
+
+    return results
+```
+
+---
+
+# 28. What if ESPN renders a pitch map as SVG?
+
+Playwright can inspect it.
+
+```python
+async def collect_svg(
+    page: Page,
+):
+    svgs = page.locator("svg")
+
+    count = await svgs.count()
+
+    result = []
+
+    for i in range(count):
+
+        svg = svgs.nth(i)
+
+        html = await svg.evaluate(
+            "(el) => el.outerHTML"
+        )
+
+        result.append({
+            "label":
+                "svg_graphic",
+
+            "index":
+                i,
+
+            "svg":
+                html,
+        })
+
+    return result
+```
+
+If the wagon wheel/pitch map is SVG, the coordinates might literally be in:
+
+```text
+<line x1="" y1="" x2="" y2="">
+<circle cx="" cy="">
+<path d="">
+```
+
+Those can potentially be normalized.
+
+---
+
+# 29. Canvas-based visualization
+
+Canvas is harder.
+
+You can detect it:
+
+```python
+async def detect_canvas(
+    page: Page,
+):
+    count = await page.locator(
+        "canvas"
+    ).count()
+
+    return {
+        "label": "canvas_count",
+        "count": count,
+    }
+```
+
+And export a visual snapshot:
+
+```python
+async def capture_canvases(
+    page: Page,
+):
+    canvases = page.locator(
+        "canvas"
+    )
+
+    result = []
+
+    for i in range(
+        await canvases.count()
+    ):
+
+        canvas = canvases.nth(i)
+
+        data_url = await canvas.evaluate(
+            """
+            canvas =>
+                canvas.toDataURL(
+                    "image/png"
+                )
+            """
+        )
+
+        result.append({
+            "label":
+                "canvas_graphic",
+
+            "index":
+                i,
+
+            "image_data_url":
+                data_url,
+        })
+
+    return result
+```
+
+But that gives you pixels, **not necessarily Hawk-Eye coordinates**.
+
+---
+
+# 30. Final complete scraper
+
+```python
+async def scrape_match_everything(
+    series_id: int,
+    match_id: int,
+):
+
+    async with ESPNBrowser() as browser:
+
+        scorecard_url = (
+            "https://www.espncricinfo.com/"
+            f"series/x-{series_id}/"
+            f"x-{match_id}/"
+            "full-scorecard"
+        )
+
+        score_capture = await capture_page(
+            browser,
+            scorecard_url,
+        )
+
+        if not score_capture.next_data:
+            raise RuntimeError(
+                "No __NEXT_DATA__ found"
+            )
+
+        data = get_app_data(
+            score_capture.next_data
+        )
+
+        innings_raw = (
+            data
+            .get("content", {})
+            .get("innings", [])
+        )
+
+        commentary = await crawl_commentary(
+            browser,
+            series_id,
+            match_id,
+        )
+
+        batting = []
+        bowling = []
+        extras = []
+        fow = []
+
+        for inn in innings_raw:
+
+            batting.append(
+                extract_batting_scorecard(
+                    inn
+                )
+            )
+
+            bowling.append(
+                extract_bowling_scorecard(
+                    inn
+                )
+            )
+
+            extras.append(
+                extract_extras(
+                    inn
+                )
+            )
+
+            fow.append(
+                extract_fall_of_wickets(
+                    inn
+                )
+            )
+
+        all_network = (
+            score_capture.network_json
+            +
+            commentary["raw_network"]
+        )
+
+        tracking_candidates = (
+            probe_tracking(
+                all_network
+            )
+        )
+
+        tracking_urls = (
+            find_tracking_urls(
+                all_network
+            )
+        )
+
+        return {
+
+            # ---------------------
+            # MATCH
+            # ---------------------
+
+            "match_metadata":
+                extract_match_metadata(
+                    data
+                ),
+
+            "series":
+                extract_series(
+                    data
+                ),
+
+            "venue":
+                extract_venue(
+                    data
+                ),
+
+            "teams":
+                extract_teams(
+                    data
+                ),
+
+            "toss":
+                extract_toss(
+                    data
+                ),
+
+            "result":
+                extract_result(
+                    data
+                ),
+
+            # ---------------------
+            # PLAYERS
+            # ---------------------
+
+            "rosters":
+                extract_rosters(
+                    data
+                ),
+
+            # ---------------------
+            # INNINGS
+            # ---------------------
+
+            "innings":
+                extract_innings(
+                    data
+                ),
+
+            "batting_scorecards":
+                batting,
+
+            "bowling_scorecards":
+                bowling,
+
+            "extras":
+                extras,
+
+            "fall_of_wickets":
+                fow,
+
+            # ---------------------
+            # COMMENTARY
+            # ---------------------
+
+            "ball_by_ball":
+                commentary[
+                    "deliveries"
+                ],
+
+            # ---------------------
+            # TRACKING / HAWKEYE
+            # ---------------------
+
+            "tracking_candidates":
+                tracking_candidates,
+
+            "tracking_network_requests":
+                tracking_urls,
+
+            # ---------------------
+            # RAW
+            # ---------------------
+
+            "raw_next_data":
+                score_capture.next_data,
+
+            "raw_page_data":
+                data,
+
+            "raw_network_json":
+                all_network,
+        }
+```
+
+Run:
+
+```python
+async def main():
+
+    dataset = await scrape_match_everything(
+        series_id=1478874,
+        match_id=1478914,
+    )
+
+    with open(
+        "espn_match_full.json",
+        "w",
+        encoding="utf-8",
+    ) as f:
+
+        json.dump(
+            dataset,
+            f,
+            indent=2,
+            ensure_ascii=False,
+        )
+
+
+asyncio.run(main())
+```
+
+---
+
+# What should feed your NLU?
+
+Only the commentary-specific part:
 
 ```json
 {
-  "match_id": 12345,
   "innings": 1,
-  "over": 17,
+  "over": 14,
   "ball": 3,
 
-  "bowler": "Mitchell Starc",
-  "batter": "Virat Kohli",
+  "batter_id": 123,
+  "bowler_id": 456,
 
+  "total_runs": 4,
+  "is_wicket": false,
+
+  "commentary": "Short and wide outside off, cut hard through backward point."
+}
+```
+
+Then your NLU adds:
+
+```json
+{
   "delivery": {
-    "line": "outside_off",
-    "length": "full",
-    "type": null,
-    "speed_kph": 143.8
+    "length": "short",
+    "line": "wide_outside_off"
   },
 
   "shot": {
-    "type": "cover_drive",
-    "region": "cover",
-    "aerial": false
-  },
-
-  "result": {
-    "runs": 4,
-    "wicket": false
-  },
-
-  "source": {
-    "structured": "cricsheet",
-    "commentary": "espncricinfo",
-    "tracking": null
+    "type": "cut",
+    "region": "backward_point"
   }
 }
 ```
 
-Then distinguish carefully between **observed structured facts** and **NLU-estimated facts**:
+So don't use NLU to infer:
+
+```text
+runs
+wicket
+batter
+bowler
+extras
+```
+
+when ESPN already gives them structurally.
+
+Use NLU for:
+
+```text
+line
+length
+shot
+shot direction
+field region
+movement
+bowling variation
+attacking/defensive intent
+misc tactical description
+```
+
+---
+
+## Hawk-Eye conclusion
+
+For the scraper architecture, absolutely include:
+
+```python
+tracking_candidates
+tracking_network_requests
+svg_graphics
+canvas_graphics
+```
+
+from day one.
+
+But your schema should be:
 
 ```json
 {
-  "line": {
-    "value": "outside_off",
-    "source": "commentary_nlu",
-    "confidence": 0.96
-  },
-
-  "length": {
-    "value": "full",
-    "source": "commentary_nlu",
-    "confidence": 0.91
+  "tracking": {
+    "available": false,
+    "provider": null,
+    "raw": null
   }
 }
 ```
 
-That way you're not pretending an estimated pitch position is Hawk-Eye precision.
+until a particular match actually exposes tracking data.
 
-### Best stack for your project
+If ESPN sends genuine Hawk-Eye-derived coordinates to the browser, Playwright can capture them because the browser must receive them to render the visualization. If ESPN only sends a prerendered image/video, you **cannot claim exact Hawk-Eye coordinates** from it. Hawk-Eye's public material confirms tracking and partner data feeds exist, but not a generally public raw cricket feed. :chatgpt-content-reference{index="20"}
 
-| Need | Source I'd use |
-|---|---|
-| Match list/results | ESPN / Cricsheet |
-| Scorecard | ESPN |
-| Batter/bowler | Cricsheet + ESPN |
-| Runs/wickets/extras | **Cricsheet** |
-| Full commentary | **ESPNcricinfo** |
-| Line | Commentary NLU |
-| Length | Commentary NLU |
-| Shot type | Commentary NLU |
-| Fielding region | Commentary NLU |
-| Exact pitch coordinates | **Hawk-Eye required** |
-| Exact ball trajectory | **Hawk-Eye required** |
-| Swing/seam measurement | **Hawk-Eye/tracking provider** |
-| Exact wagon-wheel coordinates | Tracking/scoring provider |
-| Strategy insights | **Your analytics model** |
-
-So for a portfolio/research version, **Cricsheet + ESPN commentary + your own NLU is probably the sweet spot**. You can build almost everything you described—bowler targeting patterns, approximate pitch maps, batter scoring zones, shot selection, matchup analysis, phases, and inferred strategy—while making it clear which metrics are inferred rather than true Hawk-Eye tracking. :chatgpt-content-reference{index="11"}
-
-
-If you mean the current **`python-espncricinfo`** package, then **no, not every endpoint I listed is exposed cleanly as a first-class wrapper method**.
-
-The package mainly focuses on **matches, summaries, series, and players**. Its current match implementation actually fetches ESPNcricinfo pages with Playwright and extracts embedded `__NEXT_DATA__`, partly because some older direct ESPN endpoints are blocked by Akamai. :chatgpt-content-reference{index="0"}
-
-Roughly:
-
-| Data / endpoint family | Covered by `python-espncricinfo`? |
-|---|---:|
-| Recent/current matches | Yes |
-| Match metadata | Yes |
-| Full scorecard / innings | Yes |
-| Batting scorecard | Yes |
-| Bowling scorecard | Yes |
-| Team/player lists for match | Yes |
-| Toss/result/venue/officials | Yes |
-| Series information | Yes |
-| Player profile | Yes |
-| Player stats | Yes, partly via ESPN stats pages |
-| Ball-by-ball commentary | **Partially / internally referenced** |
-| `/match/comments` URL generation | Yes |
-| All commentary pages automatically downloaded | Not as cleanly as you'd expect |
-| `/site/v2/.../summary` | Internally referenced |
-| `/site/v2/.../scoreboard` | Not really a dedicated public wrapper API |
-| `/site/v2/.../news` | No obvious high-level wrapper |
-| Team `/pages/team/home` | Not a major first-class interface |
-| Scheduled/results-by-date endpoints | Some equivalent functionality, not necessarily direct wrapper for every route |
-| Hawk-Eye data | **No** |
-| Exact pitch coordinates | **No** |
-| Ball trajectory | **No** |
-
-The interesting bit is in `Match`.
-
-The package currently contains this method:
-
-```python
-def innings_comms_url(self, innings=1, page=1):
-    return (
-        f"https://hsapi.espncricinfo.com/v1/pages/match/comments"
-        f"?lang=en&leagueId={self.series_id}&eventId={self.match_id}"
-        f"&period={innings}&page={page}&filter=full&liveTest=false"
-    )
-```
-
-So the author knows about and exposes the commentary endpoint URL internally. :chatgpt-content-reference{index="1"}
-
-It also contains:
-
-```python
-def _espn_api_url(self):
-    return (
-        f"https://site.api.espn.com/apis/site/v2/sports/cricket/"
-        f"{self.series_id}/summary?event={self.match_id}"
-    )
-```
-
-and the older core endpoint:
-
-```python
-self.event_url = (
-    "http://core.espnuk.org/v2/sports/cricket/leagues/"
-    f"{self.series_id}/events/{match_id}"
-)
-```
-
-So the package uses multiple ESPN data sources underneath. :chatgpt-content-reference{index="2"}
-
-For players it directly references both:
+So the architecture I'd settle on is:
 
 ```text
-core.espnuk.org/v2/sports/cricket/athletes/{playerId}
+                 ESPNCRICINFO
+                      │
+                Playwright/WebKit
+                      │
+      ┌───────────────┼────────────────┐
+      │               │                │
+ __NEXT_DATA__     Network JSON       DOM
+      │               │                │
+ scorecards       commentary       SVG/canvas
+ metadata         tracking?        fallback
+ players               │
+ innings               │
+      └───────────────┬┘
+                      │
+              NORMALIZED MATCH
+                      │
+        ┌─────────────┴─────────────┐
+        │                           │
+   structural data            commentary
+                                    │
+                                   NLU
+                                    │
+                   line / length / shot /
+                   region / movement
+                                    │
+                              ANALYTICS
+                                    │
+                         STRATEGY ENGINE
 ```
 
-and:
-
-```text
-hs-consumer-api.espncricinfo.com/v1/pages/player/home?playerId={playerId}
-``` :chatgpt-content-reference{index="3"}
-
-
-The bigger limitation for **your project** is commentary. The modern package's `get_comms_json()` currently says commentary is available in its fetched page content and returns `None`, rather than providing a polished method like:
-
-```python
-match.get_all_deliveries()
-```
-
-that automatically paginates every innings' `/comments` endpoint. :chatgpt-content-reference{index="4"}
-
-So I would actually use the package for discovery/metadata:
-
-```python
-from espncricinfo.match import Match
-
-matches = Match.get_recent_matches(date="2026-09-29")
-
-for ref in matches:
-    print(ref.series_id, ref.match_id)
-```
-
-then instantiate:
-
-```python
-match = Match(
-    match_id=1478914,
-    series_id=1478874
-)
-```
-
-and use fields like:
-
-```python
-match.description
-match.result
-match.all_innings
-match.team_1_players
-match.team_2_players
-```
-
-But for the thing you care about most—
-
-```text
-EVERY BALL
-+
-FULL COMMENTARY
-```
-
-—I would probably call the commentary endpoint yourself:
-
-```python
-import requests
-
-BASE = "https://hsapi.espncricinfo.com/v1/pages/match/comments"
-
-
-def get_commentary(series_id, match_id, innings, page=1):
-    params = {
-        "lang": "en",
-        "leagueId": series_id,
-        "eventId": match_id,
-        "period": innings,
-        "page": page,
-        "filter": "full",
-        "liveTest": "false",
-    }
-
-    r = requests.get(
-        BASE,
-        params=params,
-        headers={
-            "User-Agent": "Mozilla/5.0"
-        },
-        timeout=20,
-    )
-
-    r.raise_for_status()
-
-    return r.json()
-```
-
-Then paginate:
-
-```python
-all_comments = []
-
-page = 1
-
-while True:
-    data = get_commentary(
-        series_id=1478874,
-        match_id=1478914,
-        innings=1,
-        page=page,
-    )
-
-    comments = data.get("comments", [])
-
-    if not comments:
-        break
-
-    all_comments.extend(comments)
-
-    page += 1
-```
-
-Though the exact location of `comments` in the returned JSON may vary, so inspect one real response first.
-
-For your architecture, I'd therefore do:
-
-```text
-python-espncricinfo
-        ↓
-match discovery
-series ID
-match ID
-scorecard
-players
-innings
-metadata
-
-        +
-
-direct ESPN commentary endpoint
-        ↓
-full ball-by-ball commentary
-
-        ↓
-
-your parser / NLU
-        ↓
-rich delivery JSON
-```
-
-That is better than relying completely on the package.
-
-And to be clear: **nothing in `python-espncricinfo` gives you actual Hawk-Eye tracking data.** It does not solve exact pitch location, trajectory, bounce coordinates, seam movement, etc.
-
-If you want, I can next give you a **single Python client class that wraps all the ESPN endpoints we found directly**, including match discovery, scorecard, summary, player data, and automatic pagination of every commentary ball, so you don't need `python-espncricinfo` at all.
+That gives you the most future-resistant version of this project without depending directly on ESPN's internal endpoint names.
