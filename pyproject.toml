@@ -10,7 +10,6 @@ requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.142.1",
     "ipykernel>=7.4.0",
-    "python-espncricinfo>=0.5.8",
 ]
 
 [project.scripts]
