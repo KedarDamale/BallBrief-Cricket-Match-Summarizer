@@ -1,5 +1,3 @@
-Yes — for the project you described, there are useful ways to get **ESPN-style ball-by-ball data**, but **Hawk-Eye is a very different story**.
-
 ### ESPNcricinfo data
 
 ESPNcricinfo does **not appear to offer a supported public cricket developer API**. However, its website uses internal JSON endpoints, and several open-source packages wrap those endpoints or scrape the site. These are unofficial and can change. :chatgpt-content-reference{index="0"}
