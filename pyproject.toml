@@ -1,10 +1,10 @@
 [project]
-name = "cricket-match-summarizer"
+name = "BallBrief-Cricket-Match-Summarizer"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 authors = [
-    { name = "KedarDamale", email = "damalekedar@gmail.com" }
+    { name = "Kedar Damale", email = "damalekedar@gmail.com" }
 ]
 requires-python = ">=3.12"
 dependencies = [
